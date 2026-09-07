@@ -1,7 +1,7 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, ScrollView, Text, View } from "react-native";
+import { Linking, Pressable, ScrollView, Text, View } from "react-native";
 import {
   containerLogs,
   containerStats,
@@ -52,22 +52,68 @@ function now(): string {
   return new Date().toLocaleTimeString();
 }
 
-function formatPorts(ports: string): string {
-  if (!ports) return "";
+// Tailscale-IP хоста, на котором крутится демон, — ссылки на порты ведут туда.
+const TAILSCALE_IP = "100.107.34.3";
+
+interface PortEntry {
+  label: string;
+  url: string | null;
+}
+
+function portUrl(hostIp: string, hostPort: string): string | null {
+  if (!hostPort) return null;
+  // привязка только к loopback — снаружи по Tailscale недоступна
+  if (hostIp === "127.0.0.1") return null;
+  return `http://${TAILSCALE_IP}:${hostPort}`;
+}
+
+function parseCardPorts(ports: string): PortEntry[] {
+  if (!ports) return [];
   const seen = new Set<string>();
-  const out: string[] = [];
+  const out: PortEntry[] = [];
   for (const part of ports.split(",")) {
-    const cleaned = part
-      .trim()
-      .replace("0.0.0.0:", "")
-      .replace("[::]:", "")
-      .replace(":::", "");
-    if (cleaned && !seen.has(cleaned)) {
-      seen.add(cleaned);
-      out.push(cleaned);
+    const raw = part.trim();
+    if (!raw) continue;
+    const label = raw.replace("0.0.0.0:", "").replace("[::]:", "").replace(":::", "");
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    const arrow = raw.indexOf("->");
+    if (arrow === -1) {
+      out.push({ label, url: null });
+      continue;
     }
+    const left = raw.slice(0, arrow);
+    const portMatch = left.match(/(\d+)$/);
+    const ipMatch = left.match(/^(\d{1,3}(?:\.\d{1,3}){3}):/);
+    out.push({
+      label,
+      url: portUrl(ipMatch ? ipMatch[1] : "", portMatch ? portMatch[1] : ""),
+    });
   }
-  return out.join("  ");
+  return out;
+}
+
+// Строка из detail.ports: "8080/tcp → :8080, 1.2.3.4:9000" или "6379/tcp (not published)"
+function parseDetailPortLine(line: string): { prefix: string; bindings: PortEntry[] } {
+  const idx = line.indexOf(" → ");
+  if (idx === -1) return { prefix: line, bindings: [] };
+  const bindings = line
+    .slice(idx + 3)
+    .split(",")
+    .map((piece) => piece.trim())
+    .filter(Boolean)
+    .map((binding) => {
+      const m = binding.match(/^(?:(\d{1,3}(?:\.\d{1,3}){3}))?:(\d+)$/);
+      if (!m) return { label: binding, url: null };
+      return { label: binding, url: portUrl(m[1] ?? "", m[2]) };
+    });
+  return { prefix: line.slice(0, idx), bindings };
+}
+
+function openUrl(url: string) {
+  Linking.openURL(url).catch(() => {
+    // на некоторых клиентах открытие может быть запрещено — молча игнорируем
+  });
 }
 
 function formatIso(value: string): string {
@@ -379,6 +425,18 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         fontSize: 11,
         fontFamily: mono,
       },
+      portsRow: {
+        flexDirection: "row" as const,
+        flexWrap: "wrap" as const,
+        alignItems: "center" as const,
+        gap: 8,
+      },
+      portLink: {
+        color: theme.colors.accent,
+        fontSize: 11,
+        fontFamily: mono,
+        textDecorationLine: "underline" as const,
+      },
       placeholder: { color: theme.colors.foregroundMuted, fontSize: 14 },
       detail: {
         marginTop: 6,
@@ -484,11 +542,37 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
             {detail.ports.length > 0 ? (
               <>
                 <Text style={styles.sectionLabel}>Ports</Text>
-                {detail.ports.map((line) => (
-                  <Text key={line} style={styles.monoText}>
-                    {line}
-                  </Text>
-                ))}
+                {detail.ports.map((line) => {
+                  const parsed = parseDetailPortLine(line);
+                  return (
+                    <View key={line} style={styles.portsRow}>
+                      <Text style={styles.monoText}>
+                        {parsed.prefix}
+                        {parsed.bindings.length > 0 ? " →" : ""}
+                      </Text>
+                      {parsed.bindings.map((binding) => {
+                        const url = binding.url;
+                        return url ? (
+                          <Pressable
+                            key={binding.label}
+                            accessibilityRole="link"
+                            accessibilityLabel={`Open ${url}`}
+                            onPress={(event) => {
+                              event.stopPropagation();
+                              openUrl(url);
+                            }}
+                          >
+                            <Text style={styles.portLink}>{binding.label}</Text>
+                          </Pressable>
+                        ) : (
+                          <Text key={binding.label} style={styles.monoText}>
+                            {binding.label}
+                          </Text>
+                        );
+                      })}
+                    </View>
+                  );
+                })}
               </>
             ) : null}
             {detail.mounts.length > 0 ? (
@@ -546,7 +630,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       {(containers ?? []).map((item) => {
         const color = stateColor(item.state, theme.colors);
         const stats = statsById[item.id];
-        const ports = formatPorts(item.ports);
+        const ports = parseCardPorts(item.ports);
         const expanded = expandedId === item.id;
         return (
           <Pressable
@@ -575,10 +659,29 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                 </Text>
               ) : null}
             </View>
-            {ports ? (
-              <Text style={styles.monoText} numberOfLines={2}>
-                {ports}
-              </Text>
+            {ports.length > 0 ? (
+              <View style={styles.portsRow}>
+                {ports.map((entry) => {
+                  const url = entry.url;
+                  return url ? (
+                    <Pressable
+                      key={entry.label}
+                      accessibilityRole="link"
+                      accessibilityLabel={`Open ${url}`}
+                      onPress={(event) => {
+                        event.stopPropagation();
+                        openUrl(url);
+                      }}
+                    >
+                      <Text style={styles.portLink}>{entry.label}</Text>
+                    </Pressable>
+                  ) : (
+                    <Text key={entry.label} style={styles.monoText}>
+                      {entry.label}
+                    </Text>
+                  );
+                })}
+              </View>
             ) : null}
             <Text style={styles.monoText}>
               {item.id}
