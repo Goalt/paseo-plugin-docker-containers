@@ -141,6 +141,42 @@ function matchesQuery(item: ContainerInfo, query: string): boolean {
   );
 }
 
+const NO_COMPOSE_KEY = "__none__";
+
+interface ContainerGroup {
+  key: string;
+  title: string;
+  items: ContainerInfo[];
+}
+
+// Группировка по label com.docker.compose.project. Порядок внутри группы —
+// как отдал docker ps (Map хранит порядок вставки); проекты по алфавиту,
+// контейнеры без compose — всегда последней группой.
+function groupByCompose(items: ContainerInfo[]): ContainerGroup[] {
+  const byProject = new Map<string, ContainerInfo[]>();
+  for (const item of items) {
+    const project = item.composeProject ?? "";
+    const bucket = byProject.get(project);
+    if (bucket) bucket.push(item);
+    else byProject.set(project, [item]);
+  }
+  const named: string[] = [];
+  for (const project of byProject.keys()) {
+    if (project !== "") named.push(project);
+  }
+  named.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const groups: ContainerGroup[] = named.map((project) => ({
+    key: project,
+    title: project,
+    items: byProject.get(project) ?? [],
+  }));
+  const loose = byProject.get("");
+  if (loose && loose.length > 0) {
+    groups.push({ key: NO_COMPOSE_KEY, title: "Без compose", items: loose });
+  }
+  return groups;
+}
+
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -181,6 +217,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detailById, setDetailById] = useState<Record<string, DetailState>>({});
   const [envShownFor, setEnvShownFor] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   const aliveRef = useRef(true);
   // null — запросов нет; иначе значение `all` запроса в полёте. Переключение
@@ -360,6 +397,10 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     [expandedId, loadDetail],
   );
 
+  const toggleCollapse = useCallback((key: string) => {
+    setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
   const mono = layout.platform === "ios" ? "Menlo" : "monospace";
   const styles = useMemo(
     () => ({
@@ -450,6 +491,29 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         textDecorationLine: "underline" as const,
       },
       placeholder: { color: theme.colors.foregroundMuted, fontSize: 14 },
+      group: { gap: layout.compact ? 8 : 10 },
+      groupHeader: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        paddingVertical: 6,
+        paddingHorizontal: 10,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: theme.colors.foregroundMuted,
+      },
+      groupChevron: { color: theme.colors.foregroundMuted, fontSize: 12 },
+      groupTitle: {
+        color: theme.colors.foreground,
+        fontSize: 13,
+        fontWeight: "600" as const,
+        flexShrink: 1,
+      },
+      groupCount: {
+        color: theme.colors.foregroundMuted,
+        fontSize: 12,
+        marginLeft: "auto" as const,
+      },
       searchInput: {
         borderWidth: 1,
         borderColor: theme.colors.foregroundMuted,
@@ -504,6 +568,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     [containers, query],
   );
   const filtering = query.trim().length > 0;
+  const groups = useMemo(() => groupByCompose(filteredContainers), [filteredContainers]);
 
   const runningCount =
     containers === null
@@ -648,6 +713,71 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     );
   };
 
+  const renderCard = (item: ContainerInfo) => {
+    const color = stateColor(item.state, theme.colors);
+    const stats = statsById[item.id];
+    const ports = parseCardPorts(item.ports);
+    const expanded = expandedId === item.id;
+    return (
+      <Pressable
+        key={item.id}
+        accessibilityRole="button"
+        accessibilityLabel={`${expanded ? "Collapse" : "Expand"} details for ${item.name}`}
+        onPress={() => toggleExpand(item.id)}
+        style={styles.card}
+      >
+        <View style={styles.cardHeader}>
+          <View style={[styles.dot, { backgroundColor: color }]} />
+          <Text style={styles.name} numberOfLines={1}>
+            {item.name}
+          </Text>
+          <Text style={[styles.badgeText, { color }]}>{item.state}</Text>
+          <Text style={styles.chevron}>{expanded ? "▾" : "▸"}</Text>
+        </View>
+        <Text style={styles.image} numberOfLines={1}>
+          {item.image}
+        </Text>
+        <View style={styles.metaRow}>
+          <Text style={styles.meta}>{item.status}</Text>
+          {stats ? (
+            <Text style={styles.statText}>
+              CPU {stats.cpu} · MEM {stats.mem} ({stats.memPerc})
+            </Text>
+          ) : null}
+        </View>
+        {ports.length > 0 ? (
+          <View style={styles.portsRow}>
+            {ports.map((entry) => {
+              const url = entry.url;
+              return url ? (
+                <Pressable
+                  key={entry.label}
+                  accessibilityRole="link"
+                  accessibilityLabel={`Open ${url}`}
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    openUrl(url);
+                  }}
+                >
+                  <Text style={styles.portLink}>{entry.label}</Text>
+                </Pressable>
+              ) : (
+                <Text key={entry.label} style={styles.monoText}>
+                  {entry.label}
+                </Text>
+              );
+            })}
+          </View>
+        ) : null}
+        <Text style={styles.monoText}>
+          {item.id}
+          {item.networks ? `  ·  ${item.networks}` : ""}
+        </Text>
+        {expanded ? renderDetail(item) : null}
+      </Pressable>
+    );
+  };
+
   const renderContainers = () => (
     <>
       {containers !== null && containers.length === 0 ? (
@@ -655,71 +785,27 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           {showAll ? "No containers" : "No running containers"}
         </Text>
       ) : null}
-      {containers !== null && containers.length > 0 && filteredContainers.length === 0 ? (
+      {containers !== null && containers.length > 0 && groups.length === 0 ? (
         <Text style={styles.placeholder}>Nothing matches “{query.trim()}”</Text>
       ) : null}
-      {filteredContainers.map((item) => {
-        const color = stateColor(item.state, theme.colors);
-        const stats = statsById[item.id];
-        const ports = parseCardPorts(item.ports);
-        const expanded = expandedId === item.id;
+      {groups.map((group) => {
+        const hidden = collapsed[group.key] === true;
         return (
-          <Pressable
-            key={item.id}
-            accessibilityRole="button"
-            accessibilityLabel={`${expanded ? "Collapse" : "Expand"} details for ${item.name}`}
-            onPress={() => toggleExpand(item.id)}
-            style={styles.card}
-          >
-            <View style={styles.cardHeader}>
-              <View style={[styles.dot, { backgroundColor: color }]} />
-              <Text style={styles.name} numberOfLines={1}>
-                {item.name}
+          <View key={group.key} style={styles.group}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`${hidden ? "Expand" : "Collapse"} compose group ${group.title}, ${group.items.length} containers`}
+              onPress={() => toggleCollapse(group.key)}
+              style={styles.groupHeader}
+            >
+              <Text style={styles.groupChevron}>{hidden ? "▸" : "▾"}</Text>
+              <Text style={styles.groupTitle} numberOfLines={1}>
+                {group.title}
               </Text>
-              <Text style={[styles.badgeText, { color }]}>{item.state}</Text>
-              <Text style={styles.chevron}>{expanded ? "▾" : "▸"}</Text>
-            </View>
-            <Text style={styles.image} numberOfLines={1}>
-              {item.image}
-            </Text>
-            <View style={styles.metaRow}>
-              <Text style={styles.meta}>{item.status}</Text>
-              {stats ? (
-                <Text style={styles.statText}>
-                  CPU {stats.cpu} · MEM {stats.mem} ({stats.memPerc})
-                </Text>
-              ) : null}
-            </View>
-            {ports.length > 0 ? (
-              <View style={styles.portsRow}>
-                {ports.map((entry) => {
-                  const url = entry.url;
-                  return url ? (
-                    <Pressable
-                      key={entry.label}
-                      accessibilityRole="link"
-                      accessibilityLabel={`Open ${url}`}
-                      onPress={(event) => {
-                        event.stopPropagation();
-                        openUrl(url);
-                      }}
-                    >
-                      <Text style={styles.portLink}>{entry.label}</Text>
-                    </Pressable>
-                  ) : (
-                    <Text key={entry.label} style={styles.monoText}>
-                      {entry.label}
-                    </Text>
-                  );
-                })}
-              </View>
-            ) : null}
-            <Text style={styles.monoText}>
-              {item.id}
-              {item.networks ? `  ·  ${item.networks}` : ""}
-            </Text>
-            {expanded ? renderDetail(item) : null}
-          </Pressable>
+              <Text style={styles.groupCount}>{group.items.length}</Text>
+            </Pressable>
+            {hidden ? null : group.items.map((item) => renderCard(item))}
+          </View>
         );
       })}
     </>
