@@ -10,6 +10,9 @@ export const ContainerSchema = z.object({
   ports: z.string(),
   networks: z.string(),
   createdAt: z.string(),
+  // Пустая строка = контейнер запущен не через docker compose.
+  composeProject: z.string(),
+  composeService: z.string(),
 });
 
 export type ContainerInfo = z.infer<typeof ContainerSchema>;

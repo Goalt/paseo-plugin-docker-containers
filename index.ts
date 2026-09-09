@@ -98,21 +98,41 @@ function formatPortBindings(ports: unknown): string[] {
   return lines;
 }
 
+// Labels из `docker ps` — это "k=v,k=v". Ключ сверяется ТОЧНО по срезу до первого
+// "=": рядом живут сиблинги com.docker.compose.project.config_files и
+// .project.working_dir, и матч по префиксу вернул бы их значение.
+// Значение может содержать "=", поэтому режем только по первому вхождению.
+function labelValue(labels: string, key: string): string {
+  if (!labels) return "";
+  for (const part of labels.split(",")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() !== key) continue;
+    return part.slice(eq + 1);
+  }
+  return "";
+}
+
 export default function contribute(plugin: PluginContext) {
   plugin.handle(listContainers, ({ all }) => {
     const command = `docker ps${all ? " -a" : ""} --format '{{json .}}'`;
     return run(command).then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, containers: [] };
-      const containers = jsonLines(stdout).map((row) => ({
-        id: row.ID ?? "",
-        name: row.Names ?? "",
-        image: row.Image ?? "",
-        state: row.State ?? "",
-        status: row.Status ?? "",
-        ports: row.Ports ?? "",
-        networks: row.Networks ?? "",
-        createdAt: row.CreatedAt ?? "",
-      }));
+      const containers = jsonLines(stdout).map((row) => {
+        const labels = row.Labels ?? "";
+        return {
+          id: row.ID ?? "",
+          name: row.Names ?? "",
+          image: row.Image ?? "",
+          state: row.State ?? "",
+          status: row.Status ?? "",
+          ports: row.Ports ?? "",
+          networks: row.Networks ?? "",
+          createdAt: row.CreatedAt ?? "",
+          composeProject: labelValue(labels, "com.docker.compose.project"),
+          composeService: labelValue(labels, "com.docker.compose.service"),
+        };
+      });
       return { ok: true, error: null, containers };
     });
   });
