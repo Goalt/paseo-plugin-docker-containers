@@ -1,7 +1,7 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Linking, Pressable, ScrollView, Text, View } from "react-native";
+import { Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import {
   containerLogs,
   containerStats,
@@ -450,6 +450,15 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         textDecorationLine: "underline" as const,
       },
       placeholder: { color: theme.colors.foregroundMuted, fontSize: 14 },
+      searchInput: {
+        borderWidth: 1,
+        borderColor: theme.colors.foregroundMuted,
+        borderRadius: 8,
+        paddingVertical: layout.compact ? 6 : 8,
+        paddingHorizontal: 12,
+        color: theme.colors.foreground,
+        fontSize: 14,
+      },
       detail: {
         marginTop: 6,
         paddingTop: 8,
@@ -846,6 +855,19 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           </Pressable>
         ))}
       </View>
+
+      {tab === "containers" ? (
+        <TextInput
+          accessibilityLabel="Search containers"
+          value={query}
+          onChangeText={setQuery}
+          placeholder="Search by name or image"
+          placeholderTextColor={theme.colors.foregroundMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.searchInput}
+        />
+      ) : null}
 
       {sectionError ? <Text style={styles.errorText}>{sectionError}</Text> : null}
 
