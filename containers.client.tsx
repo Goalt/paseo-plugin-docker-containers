@@ -130,6 +130,17 @@ function stateColor(
   return colors.foregroundMuted;
 }
 
+// Живой фильтр списка контейнеров: подстрока в имени или в имени образа.
+// Пустой (в т.ч. пробельный) запрос пропускает всё.
+function matchesQuery(item: ContainerInfo, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  return (
+    item.name.toLowerCase().includes(needle) ||
+    item.image.toLowerCase().includes(needle)
+  );
+}
+
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -149,6 +160,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const [error, setError] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const [volumes, setVolumes] = useState<SectionState<VolumeInfo>>({
     items: null,
@@ -478,6 +490,12 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     [theme, layout.compact, mono],
   );
 
+  const filteredContainers = useMemo(
+    () => (containers ?? []).filter((item) => matchesQuery(item, query)),
+    [containers, query],
+  );
+  const filtering = query.trim().length > 0;
+
   const runningCount =
     containers === null
       ? 0
@@ -488,6 +506,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       if (containers === null) return "Loading…";
       return (
         `${runningCount} running${showAll ? ` / ${containers.length} total` : ""}` +
+        (filtering ? ` · ${filteredContainers.length} shown` : "") +
         (updatedAt ? ` · updated ${updatedAt}` : "")
       );
     }
@@ -627,7 +646,10 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           {showAll ? "No containers" : "No running containers"}
         </Text>
       ) : null}
-      {(containers ?? []).map((item) => {
+      {containers !== null && containers.length > 0 && filteredContainers.length === 0 ? (
+        <Text style={styles.placeholder}>Nothing matches “{query.trim()}”</Text>
+      ) : null}
+      {filteredContainers.map((item) => {
         const color = stateColor(item.state, theme.colors);
         const stats = statsById[item.id];
         const ports = parseCardPorts(item.ports);
