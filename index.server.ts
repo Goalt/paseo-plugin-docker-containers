@@ -1,6 +1,5 @@
-import type { PluginContext } from "@getpaseo/plugin";
+import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { exec } from "node:child_process";
-import { DockerContainers } from "./containers.client";
 import {
   containerLogs,
   containerStats,
@@ -9,10 +8,8 @@ import {
   listImages,
   listNetworks,
   listVolumes,
-} from "./contract";
+} from "./shared/contract";
 
-// Серверные хелперы. В клиентский бандл не попадают: единственные ссылки на них —
-// внутри вызовов plugin.handle, которые компилятор 0.6.1 вырезает из client-таргета.
 function run(command: string): Promise<{ error: string | null; stdout: string }> {
   return new Promise((resolve) => {
     exec(command, { timeout: 20000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -113,8 +110,8 @@ function labelValue(labels: string, key: string): string {
   return "";
 }
 
-export default function contribute(plugin: PluginContext) {
-  plugin.handle(listContainers, ({ all }) => {
+export default function contribute(server: PluginServerContext) {
+  server.handle(listContainers, ({ all }) => {
     const command = `docker ps${all ? " -a" : ""} --format '{{json .}}'`;
     return run(command).then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, containers: [] };
@@ -137,7 +134,7 @@ export default function contribute(plugin: PluginContext) {
     });
   });
 
-  plugin.handle(containerStats, () => {
+  server.handle(containerStats, () => {
     return run("docker stats --no-stream --format '{{json .}}'").then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, stats: [] };
       const stats = jsonLines(stdout).map((row) => ({
@@ -151,7 +148,7 @@ export default function contribute(plugin: PluginContext) {
     });
   });
 
-  plugin.handle(inspectContainer, ({ id }) => {
+  server.handle(inspectContainer, ({ id }) => {
     return run(`docker inspect --format '{{json .}}' ${id}`).then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, detail: null };
       let doc: Record<string, any>;
@@ -203,14 +200,14 @@ export default function contribute(plugin: PluginContext) {
     });
   });
 
-  plugin.handle(containerLogs, ({ id }) => {
+  server.handle(containerLogs, ({ id }) => {
     return run(`docker logs --tail 30 ${id} 2>&1`).then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, logs: "" };
       return { ok: true, error: null, logs: stdout.slice(-8000).trimEnd() };
     });
   });
 
-  plugin.handle(listVolumes, () => {
+  server.handle(listVolumes, () => {
     return Promise.all([run("docker volume ls --format '{{json .}}'"), psUsage()]).then(
       ([{ error, stdout }, usage]) => {
         if (error !== null) return { ok: false, error, volumes: [] };
@@ -231,7 +228,7 @@ export default function contribute(plugin: PluginContext) {
     );
   });
 
-  plugin.handle(listImages, () => {
+  server.handle(listImages, () => {
     return run("docker images --format '{{json .}}'").then(({ error, stdout }) => {
       if (error !== null) return { ok: false, error, images: [] };
       const images = jsonLines(stdout).map((row) => ({
@@ -246,7 +243,7 @@ export default function contribute(plugin: PluginContext) {
     });
   });
 
-  plugin.handle(listNetworks, () => {
+  server.handle(listNetworks, () => {
     return Promise.all([run("docker network ls --format '{{json .}}'"), psUsage()]).then(
       ([{ error, stdout }, usage]) => {
         if (error !== null) return { ok: false, error, networks: [] };
@@ -269,30 +266,5 @@ export default function contribute(plugin: PluginContext) {
     );
   });
 
-  plugin.addSurface("main", DockerContainers);
-  plugin.addSidebarItem({
-    id: "main",
-    title: "Docker",
-    icon: "Container",
-    surface: "main",
-  });
-  plugin.addWorkspacePanel({
-    id: "containers",
-    title: "Docker",
-    icon: "Container",
-    context: "workspace",
-    locations: ["workspace", "explorer"],
-    Component: DockerContainers,
-  });
-  plugin.addCommandCenterItem({
-    id: "open-docker-containers",
-    title: "Open Docker panel",
-    icon: "Container",
-    keywords: ["docker", "containers", "ps", "stats", "volumes", "images", "networks"],
-    context: "workspace",
-    onSelect({ openPanel }) {
-      openPanel("containers");
-    },
-  });
   return () => {};
 }

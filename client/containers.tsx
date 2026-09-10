@@ -1,5 +1,5 @@
-import type { PluginSurfaceProps } from "@getpaseo/plugin";
-import { useRpc } from "@getpaseo/plugin";
+import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import {
@@ -16,7 +16,7 @@ import {
   type ImageInfo,
   type NetworkInfo,
   type VolumeInfo,
-} from "./contract";
+} from "../shared/contract";
 
 const REFRESH_MS = 5000;
 

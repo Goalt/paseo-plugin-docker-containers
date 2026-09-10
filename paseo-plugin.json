@@ -1,3 +1,4 @@
 {
-  "id": "docker-containers"
+  "id": "docker-containers",
+  "requirements": { "paseo": ">=0.8.0" }
 }
