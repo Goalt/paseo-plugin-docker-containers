@@ -28,7 +28,9 @@ export const StatsSchema = z.object({
 export type ContainerStats = z.infer<typeof StatsSchema>;
 
 // id приходит из клиента и подставляется в shell-команду — формат жёстко зажат.
-const ContainerIdSchema = z.string().regex(/^[A-Za-z0-9_.-]+$/);
+// Первый символ — только буква/цифра: иначе "--help" прошёл бы как id, а
+// `docker stop --help` завершается с exit 0 и дал бы ложный ok:true.
+const ContainerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
 
 export const DetailSchema = z.object({
   id: z.string(),
@@ -125,6 +127,25 @@ export const containerLogs = defineRpc({
     ok: z.boolean(),
     error: z.string().nullable(),
     logs: z.string(),
+  }),
+});
+
+// Мутирующие RPC. error: null при успехе — форма как у read-only RPC выше.
+export const stopContainer = defineRpc({
+  name: "docker.stop",
+  input: z.object({ id: ContainerIdSchema }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const startContainer = defineRpc({
+  name: "docker.start",
+  input: z.object({ id: ContainerIdSchema }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
   }),
 });
 
