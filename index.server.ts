@@ -1,5 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { exec } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import {
   containerLogs,
   containerStats,
@@ -8,6 +10,8 @@ import {
   listImages,
   listNetworks,
   listVolumes,
+  startContainer,
+  stopContainer,
 } from "./shared/contract";
 
 function run(command: string): Promise<{ error: string | null; stdout: string }> {
@@ -110,7 +114,90 @@ function labelValue(labels: string, key: string): string {
   return "";
 }
 
+// Демон Paseo сам живёт в контейнере этого хоста: stop/rm его контейнера убил бы
+// демона вместе с этим процессом — RPC не ответил бы никогда, панель зависла бы в busy.
+interface SelfContainer {
+  id: string;
+  name: string;
+}
+
+// Кандидаты в id собственного контейнера. Внутри docker hostname = первые 12 символов
+// id (если не переопределён через --hostname). Fallback — полный id из /proc/self/cgroup
+// (cgroup v1) или /proc/self/mountinfo: на cgroup v2 в cgroup лишь "0::/", а id виден
+// в путях /var/lib/docker/containers/<id>/…
+function selfContainerCandidates(): string[] {
+  const candidates: string[] = [];
+  const host = hostname();
+  if (/^[0-9a-f]{12}$/.test(host)) candidates.push(host);
+  for (const file of ["/proc/self/cgroup", "/proc/self/mountinfo"]) {
+    try {
+      const match = readFileSync(file, "utf8").match(/(?:docker[-/]|\/containers\/)([0-9a-f]{64})/);
+      if (match) candidates.push(match[1]);
+    } catch {
+      // не Linux или нет procfs — значит, и не контейнер docker
+    }
+  }
+  return candidates;
+}
+
+// null — процесс не в контейнере (guard неактивен); undefined — docker не ответил,
+// спросим снова при следующем мутирующем вызове.
+function resolveSelfContainer(): Promise<SelfContainer | null | undefined> {
+  const candidates = selfContainerCandidates();
+  const attempt = (index: number, dockerFailed: boolean): Promise<SelfContainer | null | undefined> => {
+    if (index >= candidates.length) return Promise.resolve(dockerFailed ? undefined : null);
+    const candidate = candidates[index];
+    return run(
+      `docker container inspect --format '{{.Id}}|{{.Name}}|{{.Config.Hostname}}' -- ${candidate}`,
+    ).then(({ error, stdout }) => {
+      if (error !== null) {
+        return attempt(index + 1, dockerFailed || !/no such container/i.test(error));
+      }
+      const [id = "", name = "", configHostname = ""] = stdout.trim().split("|");
+      // 12-символьный hostname мог совпасть с чужим id случайно — засчитываем его,
+      // только если у найденного контейнера тот же hostname
+      const confirmed =
+        id.startsWith(candidate) && (candidate.length === 64 || configHostname === hostname());
+      if (!confirmed) return attempt(index + 1, dockerFailed);
+      return { id, name: name.replace(/^\//, "") };
+    });
+  };
+  return attempt(0, false);
+}
+
+// docker принимает имя, полный id и любой однозначный префикс id. Префикс сверяем
+// консервативно (без учёта регистра): хекс-имя другого контейнера, совпавшее с
+// префиксом нашего id, тоже будет заблокировано — UI всегда шлёт 12-символьный id.
+function isSelfTarget(target: string, self: SelfContainer): boolean {
+  if (self.name && target === self.name) return true;
+  const lower = target.toLowerCase();
+  return self.id.startsWith(lower) || lower.startsWith(self.id);
+}
+
 export default function contribute(server: PluginServerContext) {
+  // Собственный контейнер определяем один раз при старте; если docker тогда не
+  // ответил — переспрашиваем при каждом мутирующем вызове, пока не ответит.
+  let selfPromise = resolveSelfContainer();
+  const selfContainer = (): Promise<SelfContainer | null> =>
+    selfPromise.then((self) => {
+      if (self !== undefined) return self;
+      selfPromise = resolveSelfContainer();
+      return selfPromise.then((retry) => {
+        if (retry !== undefined) return retry;
+        // docker недоступен — сверяем хотя бы по id-кандидату, имя неизвестно
+        const candidates = selfContainerCandidates();
+        return candidates.length > 0 ? { id: candidates[candidates.length - 1], name: "" } : null;
+      });
+    });
+
+  // Текст ошибки, если цель — контейнер самого демона; иначе null. Команду тогда не выполняем.
+  const refuseSelf = (id: string, verb: string): Promise<string | null> =>
+    selfContainer().then((self) =>
+      self !== null && isSelfTarget(id, self)
+        ? `Refusing to ${verb} ${self.name || self.id.slice(0, 12)}: this container runs the Paseo daemon (and this panel)`
+        : null,
+    );
+
   server.handle(listContainers, ({ all }) => {
     const command = `docker ps${all ? " -a" : ""} --format '{{json .}}'`;
     return run(command).then(({ error, stdout }) => {
@@ -205,6 +292,23 @@ export default function contribute(server: PluginServerContext) {
       if (error !== null) return { ok: false, error, logs: "" };
       return { ok: true, error: null, logs: stdout.slice(-8000).trimEnd() };
     });
+  });
+
+  // `--` перед id: даже если схема когда-нибудь ослабнет, id не станет флагом.
+  // Повторный stop остановленного / start запущенного — exit 0, т.е. ok:true.
+  server.handle(stopContainer, ({ id }) => {
+    return refuseSelf(id, "stop").then((refusal) => {
+      if (refusal !== null) return { ok: false, error: refusal };
+      return run(`docker stop -t 5 -- ${id}`).then(({ error }) =>
+        error !== null ? { ok: false, error } : { ok: true, error: null },
+      );
+    });
+  });
+
+  server.handle(startContainer, ({ id }) => {
+    return run(`docker start -- ${id}`).then(({ error }) =>
+      error !== null ? { ok: false, error } : { ok: true, error: null },
+    );
   });
 
   server.handle(listVolumes, () => {
