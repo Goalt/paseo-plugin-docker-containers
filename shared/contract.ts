@@ -30,11 +30,13 @@ export type ContainerStats = z.infer<typeof StatsSchema>;
 // id приходит из клиента и подставляется в shell-команду — формат жёстко зажат.
 // Первый символ — только буква/цифра: иначе "--help" прошёл бы как id, а
 // `docker stop --help` завершается с exit 0 и дал бы ложный ok:true.
-const ContainerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
+// Длина ограничена: схема пропускает и имя контейнера (не только 64-hex id), а
+// мегабайтный «id» уронил бы exec с E2BIG и вывалил текст команды в UI.
+const ContainerIdSchema = z.string().max(255).regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
 
 // Имя тома тоже уходит в shell-команду: тот же формат, ведущий дефис запрещён
 // (иначе "--help"/"-f" стали бы флагами `docker volume rm`).
-const VolumeNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
+const VolumeNameSchema = z.string().max(255).regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
 
 export const DetailSchema = z.object({
   id: z.string(),
