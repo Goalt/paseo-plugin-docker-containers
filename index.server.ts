@@ -11,6 +11,7 @@ import {
   listNetworks,
   listVolumes,
   removeContainer,
+  removeVolume,
   startContainer,
   stopContainer,
 } from "./shared/contract";
@@ -321,6 +322,15 @@ export default function contribute(server: PluginServerContext) {
         error !== null ? { ok: false, error } : { ok: true, error: null },
       );
     });
+  });
+
+  // Без -f. Гейт «unused» в UI строится эвристикой mountMatches и может ошибаться —
+  // последняя линия защиты сам docker: занятый том («volume is in use») он не удалит.
+  // Текст ошибки отдаём как есть.
+  server.handle(removeVolume, ({ name }) => {
+    return run(`docker volume rm -- ${name}`).then(({ error }) =>
+      error !== null ? { ok: false, error } : { ok: true, error: null },
+    );
   });
 
   server.handle(listVolumes, () => {
