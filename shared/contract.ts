@@ -32,6 +32,10 @@ export type ContainerStats = z.infer<typeof StatsSchema>;
 // `docker stop --help` завершается с exit 0 и дал бы ложный ok:true.
 const ContainerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
 
+// Имя тома тоже уходит в shell-команду: тот же формат, ведущий дефис запрещён
+// (иначе "--help"/"-f" стали бы флагами `docker volume rm`).
+const VolumeNameSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/);
+
 export const DetailSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -154,6 +158,17 @@ export const startContainer = defineRpc({
 export const removeContainer = defineRpc({
   name: "docker.rm",
   input: z.object({ id: ContainerIdSchema }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+// Без --force: занятый том (в т.ч. остановленным контейнером) docker удалить откажется.
+// Не "docker.volumeRm": SDK пускает в имени RPC только [a-z0-9._-] и бросает на загрузке.
+export const removeVolume = defineRpc({
+  name: "docker.volume-rm",
+  input: z.object({ name: VolumeNameSchema }),
   output: z.object({
     ok: z.boolean(),
     error: z.string().nullable(),
