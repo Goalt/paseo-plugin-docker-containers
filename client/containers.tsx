@@ -10,6 +10,7 @@ import {
   listImages,
   listNetworks,
   listVolumes,
+  removeContainer,
   startContainer,
   stopContainer,
   type ContainerDetail,
@@ -183,18 +184,21 @@ function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-type ContainerAction = "stop" | "start";
+type ContainerAction = "stop" | "start" | "remove";
 
-// Какие действия допускает состояние контейнера; у dead/removing и прочих — никаких.
+// Какие действия допускает состояние контейнера; у removing и прочих — никаких.
+// Delete — только у остановленных: принудительного удаления запущенных нет.
 function allowedActions(state: string): ContainerAction[] {
   if (state === "running" || state === "restarting" || state === "paused") return ["stop"];
-  if (state === "exited" || state === "created") return ["start"];
+  if (state === "exited" || state === "created") return ["start", "remove"];
+  if (state === "dead") return ["remove"];
   return [];
 }
 
 const ACTION_LABELS: Record<ContainerAction, { idle: string; confirm: string; busy: string }> = {
   stop: { idle: "Stop", confirm: "Confirm stop?", busy: "Stopping…" },
   start: { idle: "Start", confirm: "Confirm start?", busy: "Starting…" },
+  remove: { idle: "Delete", confirm: "Confirm delete?", busy: "Deleting…" },
 };
 
 // Армированное «Confirm …?» сбрасывается, если второй тап так и не случился.
@@ -217,6 +221,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const fetchNetworks = useRpc(listNetworks);
   const callStop = useRpc(stopContainer);
   const callStart = useRpc(startContainer);
+  const callRemove = useRpc(removeContainer);
 
   const [tab, setTab] = useState<Tab>("containers");
   const [containers, setContainers] = useState<ContainerInfo[] | null>(null);
@@ -488,8 +493,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       actionBusyRef.current[id] = action;
       setActionBusyById((prev) => ({ ...prev, [id]: action }));
       setActionErrorById((prev) => omitKey(prev, id));
-      (action === "stop" ? callStop({ id }) : callStart({ id }))
-        .then((result) => (result.ok ? null : (result.error ?? `docker ${action} failed`)))
+      const request =
+        action === "stop" ? callStop({ id }) : action === "start" ? callStart({ id }) : callRemove({ id });
+      const command = action === "remove" ? "rm" : action;
+      request
+        .then((result) => (result.ok ? null : (result.error ?? `docker ${command} failed`)))
         // transport-reject (демон недоступен, таймаут RPC) — тоже инлайн-ошибка
         .catch((cause) => messageOf(cause))
         .then((failure) => {
@@ -511,7 +519,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           forceRefresh();
         });
     },
-    [callStop, callStart, loadDetail, forceRefresh],
+    [callStop, callStart, callRemove, loadDetail, forceRefresh],
   );
 
   // Первый тап армирует, второй выполняет — но только если армировано именно это
@@ -687,9 +695,9 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         borderWidth: 1,
       },
       actionText: { fontSize: layout.compact ? 12 : 13, fontWeight: "600" as const },
-      actionStop: { borderColor: theme.colors.statusDanger },
-      actionStopText: { color: theme.colors.statusDanger },
-      actionStopArmed: {
+      actionDanger: { borderColor: theme.colors.statusDanger },
+      actionDangerText: { color: theme.colors.statusDanger },
+      actionDangerArmed: {
         borderColor: theme.colors.statusDanger,
         backgroundColor: theme.colors.statusDanger,
       },
@@ -749,7 +757,8 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           const confirming = !busy && armed?.action === action;
           const labels = ACTION_LABELS[action];
           const label = busy ? labels.busy : confirming ? labels.confirm : labels.idle;
-          const stop = action === "stop";
+          // Stop и Delete — разрушительные (statusDanger), Start — accent
+          const danger = action !== "start";
           return (
             <Pressable
               key={action}
@@ -766,11 +775,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                 busy
                   ? styles.actionBusy
                   : confirming
-                    ? stop
-                      ? styles.actionStopArmed
+                    ? danger
+                      ? styles.actionDangerArmed
                       : styles.actionStartArmed
-                    : stop
-                      ? styles.actionStop
+                    : danger
+                      ? styles.actionDanger
                       : styles.actionStart,
               ]}
             >
@@ -781,8 +790,8 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                     ? styles.actionBusyText
                     : confirming
                       ? styles.actionArmedText
-                      : stop
-                        ? styles.actionStopText
+                      : danger
+                        ? styles.actionDangerText
                         : styles.actionStartText,
                 ]}
               >
