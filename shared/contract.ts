@@ -149,6 +149,17 @@ export const startContainer = defineRpc({
   }),
 });
 
+// Поля force нет намеренно: UI удаляет только остановленные, а `rm -f` дал бы любому
+// клиенту демона SIGKILL произвольного контейнера хоста. Запущенный — сначала Stop.
+export const removeContainer = defineRpc({
+  name: "docker.rm",
+  input: z.object({ id: ContainerIdSchema }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const listVolumes = defineRpc({
   name: "docker.volumes",
   input: z.object({}),

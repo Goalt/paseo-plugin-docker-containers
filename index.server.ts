@@ -10,6 +10,7 @@ import {
   listImages,
   listNetworks,
   listVolumes,
+  removeContainer,
   startContainer,
   stopContainer,
 } from "./shared/contract";
@@ -309,6 +310,17 @@ export default function contribute(server: PluginServerContext) {
     return run(`docker start -- ${id}`).then(({ error }) =>
       error !== null ? { ok: false, error } : { ok: true, error: null },
     );
+  });
+
+  // Без -f: запущенный контейнер docker откажется удалять («You cannot remove a running
+  // container»). Без -v: анонимные тома не пропадают молча — их видно на вкладке Volumes.
+  server.handle(removeContainer, ({ id }) => {
+    return refuseSelf(id, "remove").then((refusal) => {
+      if (refusal !== null) return { ok: false, error: refusal };
+      return run(`docker rm -- ${id}`).then(({ error }) =>
+        error !== null ? { ok: false, error } : { ok: true, error: null },
+      );
+    });
   });
 
   server.handle(listVolumes, () => {
