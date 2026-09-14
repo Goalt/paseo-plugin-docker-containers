@@ -11,6 +11,7 @@ import {
   listNetworks,
   listVolumes,
   removeContainer,
+  removeVolume,
   startContainer,
   stopContainer,
   type ContainerDetail,
@@ -222,6 +223,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const callStop = useRpc(stopContainer);
   const callStart = useRpc(startContainer);
   const callRemove = useRpc(removeContainer);
+  const callRemoveVolume = useRpc(removeVolume);
 
   const [tab, setTab] = useState<Tab>("containers");
   const [containers, setContainers] = useState<ContainerInfo[] | null>(null);
@@ -271,6 +273,13 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   // Коллбеки действий завершаются через секунды — раскрытую карточку читаем на тот момент.
   const expandedIdRef = useRef<string | null>(null);
   expandedIdRef.current = expandedId;
+  // Удаление томов: confirm/busy/error по имени тома — та же модель, что у контейнеров.
+  const [volumeArmed, setVolumeArmed] = useState<Record<string, boolean>>({});
+  const [volumeBusy, setVolumeBusy] = useState<Record<string, boolean>>({});
+  const [volumeError, setVolumeError] = useState<Record<string, string>>({});
+  const volumeArmTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const volumeBusyRef = useRef<Record<string, boolean>>({});
+  const pendingSectionRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     aliveRef.current = true;
@@ -278,6 +287,8 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       aliveRef.current = false;
       for (const timer of Object.values(armTimersRef.current)) clearTimeout(timer);
       armTimersRef.current = {};
+      for (const timer of Object.values(volumeArmTimersRef.current)) clearTimeout(timer);
+      volumeArmTimersRef.current = {};
     };
   }, []);
 
@@ -328,6 +339,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       sectionBusyRef.current[which] = true;
       const done = () => {
         sectionBusyRef.current[which] = false;
+        // этот ответ мог быть снят до завершения удаления тома — перечитываем
+        if (pendingSectionRef.current[which] && aliveRef.current) {
+          pendingSectionRef.current[which] = false;
+          refreshSection(which);
+        }
       };
       if (which === "volumes") {
         fetchVolumes({})
@@ -381,6 +397,77 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     },
     [fetchVolumes, fetchImages, fetchNetworks],
   );
+
+  // Как forceRefresh для контейнеров: если список секции уже в полёте, refreshSection
+  // молча выйдет — тогда перечитываем сразу после ответа летящего запроса.
+  const forceRefreshSection = useCallback(
+    (which: Exclude<Tab, "containers">) => {
+      if (sectionBusyRef.current[which]) {
+        pendingSectionRef.current[which] = true;
+        return;
+      }
+      refreshSection(which);
+    },
+    [refreshSection],
+  );
+
+  const disarmVolume = useCallback((name: string) => {
+    const timer = volumeArmTimersRef.current[name];
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      delete volumeArmTimersRef.current[name];
+    }
+    setVolumeArmed((prev) => omitKey(prev, name));
+  }, []);
+
+  const armVolume = useCallback((name: string) => {
+    const previous = volumeArmTimersRef.current[name];
+    if (previous !== undefined) clearTimeout(previous);
+    setVolumeArmed((prev) => ({ ...prev, [name]: true }));
+    volumeArmTimersRef.current[name] = setTimeout(() => {
+      delete volumeArmTimersRef.current[name];
+      if (aliveRef.current) setVolumeArmed((prev) => omitKey(prev, name));
+    }, CONFIRM_RESET_MS);
+  }, []);
+
+  const runVolumeDelete = useCallback(
+    (name: string) => {
+      volumeBusyRef.current[name] = true;
+      setVolumeBusy((prev) => ({ ...prev, [name]: true }));
+      setVolumeError((prev) => omitKey(prev, name));
+      callRemoveVolume({ name })
+        .then((result) => (result.ok ? null : (result.error ?? "docker volume rm failed")))
+        // transport-reject (демон недоступен, таймаут RPC) — тоже инлайн-ошибка
+        .catch((cause) => messageOf(cause))
+        .then((failure) => {
+          delete volumeBusyRef.current[name];
+          if (!aliveRef.current) return;
+          setVolumeBusy((prev) => omitKey(prev, name));
+          if (failure !== null) {
+            setVolumeError((prev) => ({ ...prev, [name]: failure }));
+          } else {
+            setVolumeError((prev) => omitKey(prev, name));
+            disarmVolume(name);
+          }
+          // и после ошибки: при exec-таймауте том мог всё-таки удалиться
+          forceRefreshSection("volumes");
+        });
+    },
+    [callRemoveVolume, disarmVolume, forceRefreshSection],
+  );
+
+  // Гейт по usedBy stale (вкладка без автообновления) — окончательно решает docker.
+  const pressVolumeDelete = (volume: VolumeInfo) => {
+    const name = volume.name;
+    if (volumeBusyRef.current[name]) return;
+    if (volume.usedBy.length > 0) return;
+    if (!volumeArmed[name]) {
+      armVolume(name);
+      return;
+    }
+    disarmVolume(name);
+    runVolumeDelete(name);
+  };
 
   useEffect(() => {
     if (tab !== "containers") {
@@ -1044,20 +1131,56 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       {volumes.items !== null && volumes.items.length === 0 ? (
         <Text style={styles.placeholder}>No volumes</Text>
       ) : null}
-      {(volumes.items ?? []).map((volume) => (
-        <View key={volume.name} style={styles.card}>
-          <Text style={styles.name} numberOfLines={1}>
-            {volume.name}
-          </Text>
-          <Text style={styles.meta}>
-            {volume.driver}
-            {volume.usedBy.length > 0 ? ` · used by: ${volume.usedBy.join(", ")}` : " · unused"}
-          </Text>
-          <Text style={styles.monoText} numberOfLines={1}>
-            {volume.mountpoint}
-          </Text>
-        </View>
-      ))}
+      {(volumes.items ?? []).map((volume) => {
+        const busy = volumeBusy[volume.name] === true;
+        const armed = !busy && volumeArmed[volume.name] === true;
+        const label = busy ? "Deleting…" : armed ? "Confirm delete?" : "Delete";
+        const failure = volumeError[volume.name];
+        return (
+          <View key={volume.name} style={styles.card}>
+            <Text style={styles.name} numberOfLines={1}>
+              {volume.name}
+            </Text>
+            <Text style={styles.meta}>
+              {volume.driver}
+              {volume.usedBy.length > 0 ? ` · used by: ${volume.usedBy.join(", ")}` : " · unused"}
+            </Text>
+            <Text style={styles.monoText} numberOfLines={1}>
+              {volume.mountpoint}
+            </Text>
+            {/* Карточка тома — View, а не Pressable: гасить всплытие тапа некому */}
+            {busy || volume.usedBy.length === 0 ? (
+              <View style={styles.actionRow}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`${label} volume ${volume.name}`}
+                  accessibilityState={{ disabled: busy, busy }}
+                  disabled={busy}
+                  onPress={() => pressVolumeDelete(volume)}
+                  style={[
+                    styles.actionButton,
+                    busy ? styles.actionBusy : armed ? styles.actionDangerArmed : styles.actionDanger,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.actionText,
+                      busy
+                        ? styles.actionBusyText
+                        : armed
+                          ? styles.actionArmedText
+                          : styles.actionDangerText,
+                    ]}
+                  >
+                    {label}
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
+            {failure ? <Text style={styles.errorText}>{failure}</Text> : null}
+          </View>
+        );
+      })}
     </>
   );
 
