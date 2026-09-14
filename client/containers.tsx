@@ -250,6 +250,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   // на каждом автообновлении, а эти состояния должны это переживать.
   const [armedById, setArmedById] = useState<Record<string, { action: ContainerAction }>>({});
   const [actionBusyById, setActionBusyById] = useState<Record<string, ContainerAction>>({});
+  const [actionErrorById, setActionErrorById] = useState<Record<string, string>>({});
 
   const aliveRef = useRef(true);
   // null — запросов нет; иначе значение `all` запроса в полёте. Переключение
@@ -260,6 +261,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const armTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // Синхронная копия busy: повторный тап может прийти раньше перерисовки.
   const actionBusyRef = useRef<Record<string, ContainerAction>>({});
+  // Действие просило refresh, пока такой же запрос docker ps уже был в полёте.
+  const pendingRefreshRef = useRef(false);
+  // Коллбеки действий завершаются через секунды — раскрытую карточку читаем на тот момент.
+  const expandedIdRef = useRef<string | null>(null);
+  expandedIdRef.current = expandedId;
 
   useEffect(() => {
     aliveRef.current = true;
@@ -291,6 +297,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         })
         .then(() => {
           if (busyRef.current === all) busyRef.current = null;
+          // этот ответ мог быть снят до завершения действия — повторяем в актуальном режиме
+          if (pendingRefreshRef.current && busyRef.current === null && aliveRef.current) {
+            pendingRefreshRef.current = false;
+            refresh(wantedAllRef.current);
+          }
         });
       fetchStats({})
         .then((result) => {
@@ -376,12 +387,15 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     return () => clearInterval(timer);
   }, [tab, showAll, refresh, refreshSection]);
 
+  // silent — перечитать детали, не пряча текущие (после stop/start в раскрытой карточке).
   const loadDetail = useCallback(
-    (id: string) => {
-      setDetailById((prev) => ({
-        ...prev,
-        [id]: { loading: true, error: null, detail: null, logs: null },
-      }));
+    (id: string, silent = false) => {
+      if (!silent) {
+        setDetailById((prev) => ({
+          ...prev,
+          [id]: { loading: true, error: null, detail: null, logs: null },
+        }));
+      }
       fetchInspect({ id })
         .then((result) => {
           if (!aliveRef.current) return;
@@ -393,7 +407,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                 [id]: { ...entry, loading: false, error: result.error ?? "docker inspect failed" },
               };
             }
-            return { ...prev, [id]: { ...entry, loading: false, detail: result.detail } };
+            return { ...prev, [id]: { ...entry, loading: false, error: null, detail: result.detail } };
           });
         })
         .catch((cause) => {
@@ -434,6 +448,18 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     [expandedId, loadDetail],
   );
 
+  // Refresh после действия: обычный refresh() молча выходит, если тик автообновления
+  // уже в полёте, — тогда чейнимся после него. Режим берём из wantedAllRef, а не из
+  // замыкания: за время stop сегмент Running/All могли переключить.
+  const forceRefresh = useCallback(() => {
+    const all = wantedAllRef.current;
+    if (busyRef.current === all) {
+      pendingRefreshRef.current = true;
+      return;
+    }
+    refresh(all);
+  }, [refresh]);
+
   const toggleCollapse = useCallback((key: string) => {
     setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
@@ -461,14 +487,31 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     (id: string, action: ContainerAction) => {
       actionBusyRef.current[id] = action;
       setActionBusyById((prev) => ({ ...prev, [id]: action }));
+      setActionErrorById((prev) => omitKey(prev, id));
       (action === "stop" ? callStop({ id }) : callStart({ id }))
-        .catch(() => null)
-        .then(() => {
+        .then((result) => (result.ok ? null : (result.error ?? `docker ${action} failed`)))
+        // transport-reject (демон недоступен, таймаут RPC) — тоже инлайн-ошибка
+        .catch((cause) => messageOf(cause))
+        .then((failure) => {
           delete actionBusyRef.current[id];
-          if (aliveRef.current) setActionBusyById((prev) => omitKey(prev, id));
+          if (!aliveRef.current) return;
+          setActionBusyById((prev) => omitKey(prev, id));
+          if (failure !== null) {
+            setActionErrorById((prev) => ({ ...prev, [id]: failure }));
+          }
+          const expanded = expandedIdRef.current === id;
+          if (failure === null && action === "stop" && !wantedAllRef.current && expanded) {
+            // в Running остановленный контейнер исчезнет из списка — не держим его раскрытым
+            setExpandedId(null);
+            setDetailById((prev) => omitKey(prev, id));
+          } else if (expanded) {
+            loadDetail(id, true);
+          }
+          // и при успехе, и при ошибке: после таймаута контейнер мог всё-таки смениться
+          forceRefresh();
         });
     },
-    [callStop, callStart],
+    [callStop, callStart, loadDetail, forceRefresh],
   );
 
   // Первый тап армирует, второй выполняет — но только если армировано именно это
@@ -865,6 +908,9 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                 ))
               : null}
             {renderActions(item)}
+            {actionErrorById[item.id] ? (
+              <Text style={styles.errorText}>{actionErrorById[item.id]}</Text>
+            ) : null}
             <Text style={styles.sectionLabel}>Logs (tail 30)</Text>
             <View style={styles.logsBox}>
               <Text style={styles.monoText}>
