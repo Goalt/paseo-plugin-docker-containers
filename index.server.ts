@@ -49,8 +49,11 @@ interface PsUsage {
 }
 
 // Сводка «какой контейнер что использует» для вкладок Volumes/Networks.
+// --no-trunc обязателен: без него docker режет имена томов в Mounts до 14 символов
+// + «…», и префикс-сверка засчитывала использование ВСЕМ томам с тем же началом
+// имени — у свободного соседа пропадала кнопка Delete.
 function psUsage(): Promise<PsUsage[]> {
-  return run("docker ps -a --format '{{.Names}}|{{.Mounts}}|{{.Networks}}'").then(
+  return run("docker ps -a --no-trunc --format '{{.Names}}|{{.Mounts}}|{{.Networks}}'").then(
     ({ error, stdout }) => {
       if (error !== null) return [];
       const rows: PsUsage[] = [];
@@ -68,7 +71,8 @@ function psUsage(): Promise<PsUsage[]> {
   );
 }
 
-// В `docker ps` длинные имена томов обрезаются с «…» — сверяем и по префиксу.
+// С --no-trunc имена приходят целиком; ветка «…» — страховка на случай обрезанного
+// вывода (тогда сверка по префиксу может ложно пометить соседний том занятым).
 function mountMatches(token: string, volumeName: string): boolean {
   if (token === volumeName) return true;
   if (token.endsWith("…")) return volumeName.startsWith(token.slice(0, -1));
