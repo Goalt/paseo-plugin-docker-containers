@@ -135,15 +135,26 @@ function selfContainerCandidates(): string[] {
   const candidates: string[] = [];
   const host = hostname();
   if (/^[0-9a-f]{12}$/.test(host)) candidates.push(host);
-  for (const file of ["/proc/self/cgroup", "/proc/self/mountinfo"]) {
+  const readProc = (file: string): string => {
     try {
-      const match = readFileSync(file, "utf8").match(/(?:docker[-/]|\/containers\/)([0-9a-f]{64})/);
-      if (match) candidates.push(match[1]);
+      return readFileSync(file, "utf8");
     } catch {
-      // не Linux или нет procfs — значит, и не контейнер docker
+      return ""; // не Linux или нет procfs — значит, и не контейнер docker
     }
+  };
+  // cgroup описывает сам процесс, поэтому любой docker-id в нём — наш
+  for (const match of readProc("/proc/self/cgroup").matchAll(/docker[-/]([0-9a-f]{64})/g)) {
+    candidates.push(match[1]);
   }
-  return candidates;
+  // В mountinfo берём только bind-mount собственного /etc/hostname: произвольная строка
+  // с /containers/<id> может оказаться чужим контейнером (например, при монтировании
+  // /var/lib/docker/containers), и guard навсегда запретил бы трогать невиновного.
+  for (const line of readProc("/proc/self/mountinfo").split("\n")) {
+    const fields = line.split(" ");
+    const match = (fields[3] ?? "").match(/\/containers\/([0-9a-f]{64})\/hostname$/);
+    if (match && fields[4] === "/etc/hostname") candidates.push(match[1]);
+  }
+  return [...new Set(candidates)];
 }
 
 // null — процесс не в контейнере (guard неактивен); undefined — docker не ответил,
@@ -184,25 +195,28 @@ export default function contribute(server: PluginServerContext) {
   // Собственный контейнер определяем один раз при старте; если docker тогда не
   // ответил — переспрашиваем при каждом мутирующем вызове, пока не ответит.
   let selfPromise = resolveSelfContainer();
-  const selfContainer = (): Promise<SelfContainer | null> =>
+  // undefined — мы в контейнере, но docker так и не ответил, кто мы.
+  const selfContainer = (): Promise<SelfContainer | null | undefined> =>
     selfPromise.then((self) => {
       if (self !== undefined) return self;
       selfPromise = resolveSelfContainer();
-      return selfPromise.then((retry) => {
-        if (retry !== undefined) return retry;
-        // docker недоступен — сверяем хотя бы по id-кандидату, имя неизвестно
-        const candidates = selfContainerCandidates();
-        return candidates.length > 0 ? { id: candidates[candidates.length - 1], name: "" } : null;
-      });
+      return selfPromise;
     });
 
   // Текст ошибки, если цель — контейнер самого демона; иначе null. Команду тогда не выполняем.
   const refuseSelf = (id: string, verb: string): Promise<string | null> =>
-    selfContainer().then((self) =>
-      self !== null && isSelfTarget(id, self)
+    selfContainer().then((self) => {
+      if (self === null) return null;
+      // Не знаем ни полного id, ни имени своего контейнера — цель по имени не сверить.
+      // Отказываем всем: docker только что не ответил, так что команда почти наверняка
+      // упала бы и сама, а флап dockerd не должен открывать окно на stop демона.
+      if (self === undefined) {
+        return `Refusing to ${verb} ${id}: could not identify the Paseo daemon's own container (docker did not respond), try again`;
+      }
+      return isSelfTarget(id, self)
         ? `Refusing to ${verb} ${self.name || self.id.slice(0, 12)}: this container runs the Paseo daemon (and this panel)`
-        : null,
-    );
+        : null;
+    });
 
   server.handle(listContainers, ({ all }) => {
     const command = `docker ps${all ? " -a" : ""} --format '{{json .}}'`;
