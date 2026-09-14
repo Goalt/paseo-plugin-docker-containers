@@ -10,6 +10,8 @@ import {
   listImages,
   listNetworks,
   listVolumes,
+  startContainer,
+  stopContainer,
   type ContainerDetail,
   type ContainerInfo,
   type ContainerStats,
@@ -181,6 +183,30 @@ function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+type ContainerAction = "stop" | "start";
+
+// Какие действия допускает состояние контейнера; у dead/removing и прочих — никаких.
+function allowedActions(state: string): ContainerAction[] {
+  if (state === "running" || state === "restarting" || state === "paused") return ["stop"];
+  if (state === "exited" || state === "created") return ["start"];
+  return [];
+}
+
+const ACTION_LABELS: Record<ContainerAction, { idle: string; confirm: string; busy: string }> = {
+  stop: { idle: "Stop", confirm: "Confirm stop?", busy: "Stopping…" },
+  start: { idle: "Start", confirm: "Confirm start?", busy: "Starting…" },
+};
+
+// Армированное «Confirm …?» сбрасывается, если второй тап так и не случился.
+const CONFIRM_RESET_MS = 3000;
+
+function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) return record;
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
 export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const fetchPs = useRpc(listContainers);
   const fetchStats = useRpc(containerStats);
@@ -189,6 +215,8 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const fetchVolumes = useRpc(listVolumes);
   const fetchImages = useRpc(listImages);
   const fetchNetworks = useRpc(listNetworks);
+  const callStop = useRpc(stopContainer);
+  const callStart = useRpc(startContainer);
 
   const [tab, setTab] = useState<Tab>("containers");
   const [containers, setContainers] = useState<ContainerInfo[] | null>(null);
@@ -218,6 +246,10 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const [detailById, setDetailById] = useState<Record<string, DetailState>>({});
   const [envShownFor, setEnvShownFor] = useState<Record<string, boolean>>({});
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  // Confirm и busy действий — по id в топ-левел стейте: карточки пересоздаются
+  // на каждом автообновлении, а эти состояния должны это переживать.
+  const [armedById, setArmedById] = useState<Record<string, { action: ContainerAction }>>({});
+  const [actionBusyById, setActionBusyById] = useState<Record<string, ContainerAction>>({});
 
   const aliveRef = useRef(true);
   // null — запросов нет; иначе значение `all` запроса в полёте. Переключение
@@ -225,11 +257,16 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const busyRef = useRef<boolean | null>(null);
   const wantedAllRef = useRef(false);
   const sectionBusyRef = useRef<Record<string, boolean>>({});
+  const armTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Синхронная копия busy: повторный тап может прийти раньше перерисовки.
+  const actionBusyRef = useRef<Record<string, ContainerAction>>({});
 
   useEffect(() => {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      for (const timer of Object.values(armTimersRef.current)) clearTimeout(timer);
+      armTimersRef.current = {};
     };
   }, []);
 
@@ -401,6 +438,52 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
+  const disarmAction = useCallback((id: string) => {
+    const timer = armTimersRef.current[id];
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      delete armTimersRef.current[id];
+    }
+    setArmedById((prev) => omitKey(prev, id));
+  }, []);
+
+  const armAction = useCallback((id: string, action: ContainerAction) => {
+    const previous = armTimersRef.current[id];
+    if (previous !== undefined) clearTimeout(previous);
+    setArmedById((prev) => ({ ...prev, [id]: { action } }));
+    armTimersRef.current[id] = setTimeout(() => {
+      delete armTimersRef.current[id];
+      if (aliveRef.current) setArmedById((prev) => omitKey(prev, id));
+    }, CONFIRM_RESET_MS);
+  }, []);
+
+  const runAction = useCallback(
+    (id: string, action: ContainerAction) => {
+      actionBusyRef.current[id] = action;
+      setActionBusyById((prev) => ({ ...prev, [id]: action }));
+      (action === "stop" ? callStop({ id }) : callStart({ id }))
+        .catch(() => null)
+        .then(() => {
+          delete actionBusyRef.current[id];
+          if (aliveRef.current) setActionBusyById((prev) => omitKey(prev, id));
+        });
+    },
+    [callStop, callStart],
+  );
+
+  // Первый тап армирует, второй выполняет — но только если армировано именно это
+  // действие и текущий state контейнера его всё ещё допускает.
+  const pressAction = (item: ContainerInfo, action: ContainerAction) => {
+    if (actionBusyRef.current[item.id] !== undefined) return;
+    if (!allowedActions(item.state).includes(action)) return;
+    if (armedById[item.id]?.action !== action) {
+      armAction(item.id, action);
+      return;
+    }
+    disarmAction(item.id);
+    runAction(item.id, action);
+  };
+
   const mono = layout.platform === "ios" ? "Menlo" : "monospace";
   const styles = useMemo(
     () => ({
@@ -553,6 +636,26 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         borderColor: theme.colors.foregroundMuted,
       },
       envButtonText: { color: theme.colors.foregroundMuted, fontSize: 12 },
+      actionRow: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8, marginTop: 2 },
+      actionButton: {
+        paddingVertical: layout.compact ? 4 : 6,
+        paddingHorizontal: layout.compact ? 10 : 14,
+        borderRadius: 6,
+        borderWidth: 1,
+      },
+      actionText: { fontSize: layout.compact ? 12 : 13, fontWeight: "600" as const },
+      actionStop: { borderColor: theme.colors.statusDanger },
+      actionStopText: { color: theme.colors.statusDanger },
+      actionStopArmed: {
+        borderColor: theme.colors.statusDanger,
+        backgroundColor: theme.colors.statusDanger,
+      },
+      actionStart: { borderColor: theme.colors.accent },
+      actionStartText: { color: theme.colors.accent },
+      actionStartArmed: { borderColor: theme.colors.accent, backgroundColor: theme.colors.accent },
+      actionArmedText: { color: theme.colors.accentForeground },
+      actionBusy: { borderColor: theme.colors.foregroundMuted },
+      actionBusyText: { color: theme.colors.foregroundMuted },
       logsBox: {
         borderWidth: 1,
         borderColor: theme.colors.foregroundMuted,
@@ -588,6 +691,66 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     if (section.items === null) return section.error ? "failed" : "Loading…";
     return `${section.items.length} ${tab}` + (section.updatedAt ? ` · updated ${section.updatedAt}` : "");
   })();
+
+  const renderActions = (item: ContainerInfo) => {
+    const busyAction = actionBusyById[item.id];
+    const busy = busyAction !== undefined;
+    // Пока запрос в полёте, state может смениться автообновлением — показываем
+    // инертную busy-кнопку того действия, что выполняется.
+    const actions = busy ? [busyAction] : allowedActions(item.state);
+    if (actions.length === 0) return null;
+    const armed = armedById[item.id];
+    return (
+      <View style={styles.actionRow}>
+        {actions.map((action) => {
+          const confirming = !busy && armed?.action === action;
+          const labels = ACTION_LABELS[action];
+          const label = busy ? labels.busy : confirming ? labels.confirm : labels.idle;
+          const stop = action === "stop";
+          return (
+            <Pressable
+              key={action}
+              accessibilityRole="button"
+              accessibilityLabel={`${label} ${item.name}`}
+              accessibilityState={{ disabled: busy, busy }}
+              onPress={(event) => {
+                // не `disabled`: тап по отключённой вложенной кнопке ушёл бы карточке и свернул её
+                event.stopPropagation();
+                pressAction(item, action);
+              }}
+              style={[
+                styles.actionButton,
+                busy
+                  ? styles.actionBusy
+                  : confirming
+                    ? stop
+                      ? styles.actionStopArmed
+                      : styles.actionStartArmed
+                    : stop
+                      ? styles.actionStop
+                      : styles.actionStart,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.actionText,
+                  busy
+                    ? styles.actionBusyText
+                    : confirming
+                      ? styles.actionArmedText
+                      : stop
+                        ? styles.actionStopText
+                        : styles.actionStartText,
+                ]}
+              >
+                {label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    );
+  };
 
   const renderDetail = (item: ContainerInfo) => {
     const entry = detailById[item.id];
@@ -701,6 +864,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
                   </Text>
                 ))
               : null}
+            {renderActions(item)}
             <Text style={styles.sectionLabel}>Logs (tail 30)</Text>
             <View style={styles.logsBox}>
               <Text style={styles.monoText}>
