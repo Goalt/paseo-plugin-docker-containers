@@ -508,7 +508,16 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
             setActionErrorById((prev) => ({ ...prev, [id]: failure }));
           }
           const expanded = expandedIdRef.current === id;
-          if (failure === null && action === "stop" && !wantedAllRef.current && expanded) {
+          if (failure === null && action === "remove") {
+            // Контейнера больше нет: сворачиваем, только если раскрыт именно он (иначе
+            // свернули бы чужую карточку, раскрытую, пока запрос был в полёте), и
+            // чистим все записи этого id.
+            setExpandedId((prev) => (prev === id ? null : prev));
+            setDetailById((prev) => omitKey(prev, id));
+            setEnvShownFor((prev) => omitKey(prev, id));
+            setActionErrorById((prev) => omitKey(prev, id));
+            disarmAction(id);
+          } else if (failure === null && action === "stop" && !wantedAllRef.current && expanded) {
             // в Running остановленный контейнер исчезнет из списка — не держим его раскрытым
             setExpandedId(null);
             setDetailById((prev) => omitKey(prev, id));
@@ -519,7 +528,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           forceRefresh();
         });
     },
-    [callStop, callStart, callRemove, loadDetail, forceRefresh],
+    [callStop, callStart, callRemove, disarmAction, loadDetail, forceRefresh],
   );
 
   // Первый тап армирует, второй выполняет — но только если армировано именно это
