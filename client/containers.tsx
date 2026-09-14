@@ -50,8 +50,6 @@ interface DetailState {
   logs: string | null;
 }
 
-const EMPTY_DETAIL: DetailState = { loading: false, error: null, detail: null, logs: null };
-
 function now(): string {
   return new Date().toLocaleTimeString();
 }
@@ -212,6 +210,15 @@ function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
   return next;
 }
 
+// Оставляет только ключи из keep; без изменений возвращает тот же объект (без ререндера).
+function keepKeys<T>(record: Record<string, T>, keep: Set<string>): Record<string, T> {
+  const stale = Object.keys(record).filter((key) => !keep.has(key));
+  if (stale.length === 0) return record;
+  const next = { ...record };
+  for (const key of stale) delete next[key];
+  return next;
+}
+
 export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const fetchPs = useRpc(listContainers);
   const fetchStats = useRpc(containerStats);
@@ -306,6 +313,9 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           }
           setError(null);
           setContainers(result.containers);
+          // ошибки действий исчезнувших из списка контейнеров иначе жили бы до анмаунта
+          const present = new Set(result.containers.map((item) => item.id));
+          setActionErrorById((prev) => keepKeys(prev, present));
           setUpdatedAt(now());
         })
         .catch((cause) => {
@@ -349,6 +359,10 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         fetchVolumes({})
           .then((result) => {
             if (!aliveRef.current) return;
+            if (result.ok) {
+              const present = new Set(result.volumes.map((volume) => volume.name));
+              setVolumeError((prev) => keepKeys(prev, present));
+            }
             setVolumes(
               result.ok
                 ? { items: result.volumes, error: null, updatedAt: now() }
@@ -492,7 +506,9 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         .then((result) => {
           if (!aliveRef.current) return;
           setDetailById((prev) => {
-            const entry = prev[id] ?? EMPTY_DETAIL;
+            // запись уже вычищена (stop в Running / удаление) — запоздавший ответ её не воскрешает
+            const entry = prev[id];
+            if (!entry) return prev;
             if (!result.ok) {
               return {
                 ...prev,
@@ -504,10 +520,11 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         })
         .catch((cause) => {
           if (!aliveRef.current) return;
-          setDetailById((prev) => ({
-            ...prev,
-            [id]: { ...(prev[id] ?? EMPTY_DETAIL), loading: false, error: messageOf(cause) },
-          }));
+          setDetailById((prev) => {
+            const entry = prev[id];
+            if (!entry) return prev;
+            return { ...prev, [id]: { ...entry, loading: false, error: messageOf(cause) } };
+          });
         });
       fetchLogs({ id })
         .then((result) => {
