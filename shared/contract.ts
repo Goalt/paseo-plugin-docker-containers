@@ -23,9 +23,18 @@ export const StatsSchema = z.object({
   cpu: z.string(),
   mem: z.string(),
   memPerc: z.string(),
+  // Уже распарсены на сервере: проценты CPU (12.34) и байты использования памяти.
+  cpuNum: z.number(),
+  memBytes: z.number(),
 });
 
 export type ContainerStats = z.infer<typeof StatsSchema>;
+
+// sizeRw — размер writable-слоя контейнера в байтах (`docker ps --size` без «virtual»).
+export const SizeSchema = z.object({
+  id: z.string(),
+  sizeRw: z.number(),
+});
 
 // id приходит из клиента и подставляется в shell-команду — формат жёстко зажат.
 // Первый символ — только буква/цифра: иначе "--help" прошёл бы как id, а
@@ -113,6 +122,16 @@ export const containerStats = defineRpc({
     ok: z.boolean(),
     error: z.string().nullable(),
     stats: z.array(StatsSchema),
+  }),
+});
+
+export const containerSizes = defineRpc({
+  name: "docker.sizes",
+  input: z.object({}),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().nullable(),
+    sizes: z.array(SizeSchema),
   }),
 });
 

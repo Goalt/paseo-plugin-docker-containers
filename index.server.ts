@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import {
   containerLogs,
+  containerSizes,
   containerStats,
   inspectContainer,
   listContainers,
@@ -118,6 +119,35 @@ function labelValue(labels: string, key: string): string {
     return part.slice(eq + 1);
   }
   return "";
+}
+
+// Ключи в нижнем регистре: «kB» и «KiB» всё равно расходятся (kb ≠ kib).
+// docker пишет десятичные единицы в `ps --size`/BlockIO и бинарные в MemUsage.
+const SIZE_UNITS: Record<string, number> = {
+  b: 1,
+  kb: 1e3,
+  mb: 1e6,
+  gb: 1e9,
+  tb: 1e12,
+  kib: 1024,
+  mib: 1024 ** 2,
+  gib: 1024 ** 3,
+  tib: 1024 ** 4,
+};
+
+// "532.5MiB" / "2.5MB" / "0B" → байты; всё нераспознанное (в т.ч. "--") → 0.
+function parseSize(value: string): number {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*([A-Za-z]*)$/);
+  if (!match) return 0;
+  const factor = SIZE_UNITS[(match[2] || "b").toLowerCase()];
+  if (factor === undefined) return 0;
+  return Math.round(Number(match[1]) * factor);
+}
+
+// "12.34%" → 12.34; "--" и мусор → 0.
+function parsePercent(value: string): number {
+  const num = Number.parseFloat(value.replace("%", ""));
+  return Number.isFinite(num) ? num : 0;
 }
 
 // Демон Paseo сам живёт в контейнере этого хоста: stop/rm его контейнера убил бы
@@ -250,8 +280,26 @@ export default function contribute(server: PluginServerContext) {
         cpu: row.CPUPerc ?? "",
         mem: row.MemUsage ?? "",
         memPerc: row.MemPerc ?? "",
+        cpuNum: parsePercent(row.CPUPerc ?? ""),
+        // MemUsage — "использовано / лимит", считаем только использованное
+        memBytes: parseSize((row.MemUsage ?? "").split(" / ")[0] ?? ""),
       }));
       return { ok: true, error: null, stats };
+    });
+  });
+
+  server.handle(containerSizes, () => {
+    return run("docker ps -a --size --format '{{.ID}}|{{.Size}}'").then(({ error, stdout }) => {
+      if (error !== null) return { ok: false, error, sizes: [] };
+      const sizes: { id: string; sizeRw: number }[] = [];
+      for (const line of stdout.split("\n")) {
+        if (!line.trim()) continue;
+        const [id, size] = line.split("|");
+        if (!id) continue;
+        // "2.5MB (virtual 1.2GB)" — занятое место это writable-слой до «(virtual …)»
+        sizes.push({ id: id.trim(), sizeRw: parseSize((size ?? "").split(" (virtual")[0] ?? "") });
+      }
+      return { ok: true, error: null, sizes };
     });
   });
 

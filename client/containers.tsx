@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import {
   containerLogs,
+  containerSizes,
   containerStats,
   inspectContainer,
   listContainers,
@@ -23,6 +24,8 @@ import {
 } from "../shared/contract";
 
 const REFRESH_MS = 5000;
+// `docker ps --size` считает writable-слои на диске — дорого, обновляем реже статов.
+const SIZES_REFRESH_MS = 60000;
 
 // ВАЖНО: в этом файле нельзя использовать async/await — компилятор демона 0.6.1
 // не понижает синтаксис для клиентского бандла, и Hermes на iOS/Android его не съест.
@@ -179,6 +182,71 @@ function groupByCompose(items: ContainerInfo[]): ContainerGroup[] {
   return groups;
 }
 
+const BYTE_UNITS = ["KiB", "MiB", "GiB", "TiB"];
+
+// Бинарный стиль docker: "512B", "1.2GiB" — без пробела перед единицей.
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes)}B`;
+  let value = bytes / 1024;
+  let unit = 0;
+  // сравниваем уже округлённое значение, иначе 1023.97KiB покажется как "1024.0KiB"
+  while (Math.round(value * 10) >= 10240 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)}${BYTE_UNITS[unit]}`;
+}
+
+const DECIMAL_BYTE_UNITS = ["kB", "MB", "GB", "TB"];
+
+// Десятичный стиль `docker ps --size`: "999B", "81.9kB", "368.0MB" — чтобы HDD
+// совпадал с цифрами docker CLI.
+function formatDecimalBytes(bytes: number): string {
+  if (bytes < 1000) return `${Math.round(bytes)}B`;
+  let value = bytes / 1000;
+  let unit = 0;
+  // та же защита от "1000.0kB", что и в formatBytes
+  while (Math.round(value * 10) >= 10000 && unit < DECIMAL_BYTE_UNITS.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return `${value.toFixed(1)}${DECIMAL_BYTE_UNITS[unit]}`;
+}
+
+// Сводка для заголовка группы: CPU/MEM — по контейнерам со статами (запущенные),
+// HDD — по контейнерам с известным размером. Нет данных — пустая строка.
+function groupMetrics(
+  items: ContainerInfo[],
+  statsById: Record<string, ContainerStats>,
+  sizeById: Record<string, number>,
+): string {
+  let cpu = 0;
+  let mem = 0;
+  let disk = 0;
+  let withStats = 0;
+  let withSize = 0;
+  for (const item of items) {
+    const stats = statsById[item.id];
+    if (stats) {
+      cpu += stats.cpuNum;
+      mem += stats.memBytes;
+      withStats += 1;
+    }
+    const size = sizeById[item.id];
+    if (size !== undefined) {
+      disk += size;
+      withSize += 1;
+    }
+  }
+  const parts: string[] = [];
+  if (withStats > 0) {
+    parts.push(`CPU ${cpu.toFixed(1)}%`);
+    parts.push(`MEM ${formatBytes(mem)}`);
+  }
+  if (withSize > 0) parts.push(`HDD ${formatDecimalBytes(disk)}`);
+  return parts.join(" · ");
+}
+
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -222,6 +290,7 @@ function keepKeys<T>(record: Record<string, T>, keep: Set<string>): Record<strin
 export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const fetchPs = useRpc(listContainers);
   const fetchStats = useRpc(containerStats);
+  const fetchSizes = useRpc(containerSizes);
   const fetchInspect = useRpc(inspectContainer);
   const fetchLogs = useRpc(containerLogs);
   const fetchVolumes = useRpc(listVolumes);
@@ -235,6 +304,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const [tab, setTab] = useState<Tab>("containers");
   const [containers, setContainers] = useState<ContainerInfo[] | null>(null);
   const [statsById, setStatsById] = useState<Record<string, ContainerStats>>({});
+  const [sizeById, setSizeById] = useState<Record<string, number>>({});
   const [error, setError] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
@@ -272,6 +342,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   const busyRef = useRef<boolean | null>(null);
   const wantedAllRef = useRef(false);
   const sectionBusyRef = useRef<Record<string, boolean>>({});
+  const sizesBusyRef = useRef(false);
   const armTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // Синхронная копия busy: повторный тап может прийти раньше перерисовки.
   const actionBusyRef = useRef<Record<string, ContainerAction>>({});
@@ -342,6 +413,24 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     },
     [fetchPs, fetchStats],
   );
+
+  const refreshSizes = useCallback(() => {
+    if (sizesBusyRef.current) return;
+    sizesBusyRef.current = true;
+    fetchSizes({})
+      .then((result) => {
+        if (!aliveRef.current || !result.ok) return;
+        const next: Record<string, number> = {};
+        for (const row of result.sizes) next[row.id] = row.sizeRw;
+        setSizeById(next);
+      })
+      .catch(() => {
+        // размеры — вспомогательные данные; их сбой не должен ронять список
+      })
+      .then(() => {
+        sizesBusyRef.current = false;
+      });
+  }, [fetchSizes]);
 
   const refreshSection = useCallback(
     (which: Exclude<Tab, "containers">) => {
@@ -492,6 +581,14 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
     const timer = setInterval(() => refresh(showAll), REFRESH_MS);
     return () => clearInterval(timer);
   }, [tab, showAll, refresh, refreshSection]);
+
+  // Размеры берутся с `ps -a`, поэтому от Running↔All не зависят.
+  useEffect(() => {
+    if (tab !== "containers") return;
+    refreshSizes();
+    const timer = setInterval(refreshSizes, SIZES_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [tab, refreshSizes]);
 
   // silent — перечитать детали, не пряча текущие (после stop/start в раскрытой карточке).
   const loadDetail = useCallback(
@@ -740,15 +837,19 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       placeholder: { color: theme.colors.foregroundMuted, fontSize: 14 },
       group: { gap: layout.compact ? 8 : 10 },
       groupHeader: {
-        flexDirection: "row" as const,
-        alignItems: "center" as const,
-        gap: 8,
+        gap: 2,
         paddingVertical: 6,
         paddingHorizontal: 10,
         borderRadius: 8,
         borderWidth: 1,
         borderColor: theme.colors.foregroundMuted,
       },
+      groupHeaderRow: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+      },
+      groupMetrics: { color: theme.colors.foregroundMuted, fontSize: layout.compact ? 11 : 12 },
       groupChevron: { color: theme.colors.foregroundMuted, fontSize: 12 },
       groupTitle: {
         color: theme.colors.foreground,
@@ -761,7 +862,9 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         fontSize: 12,
         marginLeft: "auto" as const,
       },
+      searchRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
       searchInput: {
+        flex: 1,
         borderWidth: 1,
         borderColor: theme.colors.foregroundMuted,
         borderRadius: 8,
@@ -770,6 +873,14 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
         color: theme.colors.foreground,
         fontSize: 14,
       },
+      collapseAllButton: {
+        paddingVertical: layout.compact ? 6 : 8,
+        paddingHorizontal: layout.compact ? 10 : 12,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: theme.colors.foregroundMuted,
+      },
+      collapseAllText: { color: theme.colors.foregroundMuted, fontSize: 13 },
       detail: {
         marginTop: 6,
         paddingTop: 8,
@@ -836,6 +947,19 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
   );
   const filtering = query.trim().length > 0;
   const groups = useMemo(() => groupByCompose(filteredContainers), [filteredContainers]);
+  const allCollapsed = groups.length > 0 && groups.every((g) => collapsed[g.key] === true);
+
+  // Трогаем только ключи видимых (после поиска) групп — состояние скрытых
+  // фильтром групп сохраняется. Решение «свернуть/развернуть» берём из prev,
+  // чтобы быстрые повторные нажатия не опирались на устаревший рендер.
+  const toggleCollapseAll = useCallback(() => {
+    setCollapsed((prev) => {
+      const collapse = !groups.every((g) => prev[g.key] === true);
+      const next = { ...prev };
+      for (const group of groups) next[group.key] = collapse;
+      return next;
+    });
+  }, [groups]);
 
   const runningCount =
     containers === null
@@ -1122,6 +1246,7 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       ) : null}
       {groups.map((group) => {
         const hidden = collapsed[group.key] === true;
+        const metrics = groupMetrics(group.items, statsById, sizeById);
         return (
           <View key={group.key} style={styles.group}>
             <Pressable
@@ -1130,11 +1255,18 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
               onPress={() => toggleCollapse(group.key)}
               style={styles.groupHeader}
             >
-              <Text style={styles.groupChevron}>{hidden ? "▸" : "▾"}</Text>
-              <Text style={styles.groupTitle} numberOfLines={1}>
-                {group.title}
-              </Text>
-              <Text style={styles.groupCount}>{group.items.length}</Text>
+              <View style={styles.groupHeaderRow}>
+                <Text style={styles.groupChevron}>{hidden ? "▸" : "▾"}</Text>
+                <Text style={styles.groupTitle} numberOfLines={1}>
+                  {group.title}
+                </Text>
+                <Text style={styles.groupCount}>{group.items.length}</Text>
+              </View>
+              {metrics ? (
+                <Text style={styles.groupMetrics} numberOfLines={1}>
+                  {metrics}
+                </Text>
+              ) : null}
             </Pressable>
             {hidden ? null : group.items.map((item) => renderCard(item))}
           </View>
@@ -1286,7 +1418,14 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Refresh"
-            onPress={() => (tab === "containers" ? refresh(showAll) : refreshSection(tab))}
+            onPress={() => {
+              if (tab !== "containers") {
+                refreshSection(tab);
+                return;
+              }
+              refresh(showAll);
+              refreshSizes();
+            }}
             style={styles.refreshButton}
           >
             <Text style={styles.refreshText}>Refresh</Text>
@@ -1311,16 +1450,32 @@ export function DockerContainers({ theme, layout }: PluginSurfaceProps) {
       </View>
 
       {tab === "containers" ? (
-        <TextInput
-          accessibilityLabel="Search containers"
-          value={query}
-          onChangeText={setQuery}
-          placeholder="Search by name or image"
-          placeholderTextColor={theme.colors.foregroundMuted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.searchInput}
-        />
+        <View style={styles.searchRow}>
+          <TextInput
+            accessibilityLabel="Search containers"
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search by name or image"
+            placeholderTextColor={theme.colors.foregroundMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={styles.searchInput}
+          />
+          {groups.length > 0 ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={
+                allCollapsed ? "Expand all compose groups" : "Collapse all compose groups"
+              }
+              onPress={toggleCollapseAll}
+              style={styles.collapseAllButton}
+            >
+              <Text style={styles.collapseAllText}>
+                {allCollapsed ? "Expand all" : "Collapse all"}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
       ) : null}
 
       {sectionError ? <Text style={styles.errorText}>{sectionError}</Text> : null}
